@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"html/template"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -41,10 +42,13 @@ type platformDetails struct {
 var (
 	templates = template.Must(template.New("").
 			Funcs(template.FuncMap{
-			"renderMoney": renderMoney,
+			"renderMoney":        renderMoney,
+			"renderCurrencyLogo": renderCurrencyLogo,
 		}).ParseGlob("templates/*.html"))
 	plat platformDetails
 )
+
+var validEnvs = []string{"local", "gcp", "azure", "aws", "onprem"}
 
 func (fe *frontendServer) homeHandler(w http.ResponseWriter, r *http.Request) {
 	log := r.Context().Value(ctxKeyLog{}).(logrus.FieldLogger)
@@ -79,8 +83,21 @@ func (fe *frontendServer) homeHandler(w http.ResponseWriter, r *http.Request) {
 		ps[i] = productView{p, price}
 	}
 
-	//get env and render correct platform banner.
+	// Set ENV_PLATFORM (default to local if not set; use env var if set; otherwise detect GCP, which overrides env)_
 	var env = os.Getenv("ENV_PLATFORM")
+	// Only override from env variable if set + valid env
+	if env == "" || stringinSlice(validEnvs, env) == false {
+		fmt.Println("env platform is either empty or invalid")
+		env = "local"
+	}
+	// Autodetect GCP
+	addrs, err := net.LookupHost("metadata.google.internal.")
+	if err == nil && len(addrs) >= 0 {
+		log.Debugf("Detected Google metadata server: %v, setting ENV_PLATFORM to GCP.", addrs)
+		env = "gcp"
+	}
+
+	log.Debugf("ENV_PLATFORM is: %s", env)
 	plat = platformDetails{}
 	plat.setPlatformDetails(strings.ToLower(env))
 
@@ -111,9 +128,12 @@ func (plat *platformDetails) setPlatformDetails(env string) {
 	} else if env == "azure" {
 		plat.provider = "Azure"
 		plat.css = "azure-platform"
-	} else {
+	} else if env == "gcp" {
 		plat.provider = "Google Cloud"
 		plat.css = "gcp-platform"
+	} else {
+		plat.provider = "local"
+		plat.css = "local"
 	}
 }
 
@@ -333,7 +353,8 @@ func (fe *frontendServer) placeOrderHandler(w http.ResponseWriter, r *http.Reque
 
 	totalPaid := *order.GetOrder().GetShippingCost()
 	for _, v := range order.GetOrder().GetItems() {
-		totalPaid = money.Must(money.Sum(totalPaid, *v.GetCost()))
+		multPrice := money.MultiplySlow(*v.GetCost(), uint32(v.GetItem().GetQuantity()))
+		totalPaid = money.Must(money.Sum(totalPaid, multPrice))
 	}
 
 	currencies, err := fe.getCurrencies(r.Context())
@@ -407,12 +428,15 @@ func renderHTTPError(log logrus.FieldLogger, r *http.Request, w http.ResponseWri
 	errMsg := fmt.Sprintf("%+v", err)
 
 	w.WriteHeader(code)
-	templates.ExecuteTemplate(w, "error", map[string]interface{}{
+	if templateErr := templates.ExecuteTemplate(w, "error", map[string]interface{}{
 		"session_id":  sessionID(r),
 		"request_id":  r.Context().Value(ctxKeyRequestID{}),
 		"error":       errMsg,
 		"status_code": code,
-		"status":      http.StatusText(code)})
+		"status":      http.StatusText(code),
+	}); templateErr != nil {
+		log.Println(templateErr)
+	}
 }
 
 func currentCurrency(r *http.Request) string {
@@ -450,4 +474,30 @@ func cartSize(c []*pb.CartItem) int {
 
 func renderMoney(money pb.Money) string {
 	return fmt.Sprintf("%s %d.%02d", money.GetCurrencyCode(), money.GetUnits(), money.GetNanos()/10000000)
+}
+
+func renderCurrencyLogo(currencyCode string) string {
+	logos := map[string]string{
+		"USD": "$",
+		"CAD": "$",
+		"JPY": "¥",
+		"EUR": "€",
+		"TRY": "₺",
+		"GBP": "£",
+	}
+
+	logo := "$" //default
+	if val, ok := logos[currencyCode]; ok {
+		logo = val
+	}
+	return logo
+}
+
+func stringinSlice(slice []string, val string) bool {
+	for _, item := range slice {
+		if item == val {
+			return true
+		}
+	}
+	return false
 }
